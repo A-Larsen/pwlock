@@ -1,0 +1,347 @@
+#!/bin/env python3
+
+from __future__ import print_function
+import sys
+import os
+from getpass import getpass
+import subprocess
+import tempfile
+import random
+import sqlite3
+import datetime
+import pyperclip
+
+schema = \
+["""\
+CREATE TABLE current (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  place varchar(255),
+  username varchar(255),
+  password varchar(255),
+  email varchar(255),
+  date BIGINT
+);\
+""",
+"""\
+CREATE TABLE old (
+  id BIGINT,
+  type varchar(255),
+  value LONGBLOB,
+  date BIGINT
+);\
+"""]
+
+USER = os.getenv("USER")
+HOME = os.getenv("HOME")
+
+# Change these two variables if you don't like
+# the database location or file name
+encdbpath = f"{HOME}/"
+encdbfile = ".passlock.db"
+
+args = sys.argv[1:]
+argslen = len(args)
+
+conn = None
+c = None
+tmp_fp = None
+timestamp = datetime.datetime.now().strftime("%s")
+
+def enditall(status): # :(
+    conn.close()
+    tmp_fp.close()
+    sys.exit(status)
+
+def genSecure( timestamp):
+    out = ""
+    random.seed(timestamp)
+
+    for i in range(random.randint(8, 14)):
+        char = chr(random.randint(33, 126))
+
+        out = out + char
+
+    return out
+
+def escapeDoubleQuote(string):
+    newstr = ""
+
+    for ch in string:
+        if ch == '\"':
+            newstr += '\\'
+
+        newstr += ch
+
+    print(newstr)
+
+    return newstr
+
+def eprint(*args, **kwargs):
+    # \x1b is the escape symbol in ascii
+    newargs = ("\x1b[31mERORR:\x1b[39m",) + args
+    print(*newargs, file=sys.stderr, **kwargs)
+
+def create_site(cursor, timestamp, info=()):
+    place, email, username, password = info
+    cursor.execute("""
+                        INSERT INTO 
+                        current (place, username, password, email, date) 
+                        VALUES (?,?,?,?,?)
+                    """
+             ,(place, username, password, email, timestamp))
+
+def decrypt_tmp_db(file, password):
+    os.system(f"""
+        openssl enc \
+        -aes-256-cbc \
+        -iter 100000 \
+        -salt \
+        -d \
+        -pass pass:{password} \
+        -in {encdbpath + encdbfile} \
+        > {file}
+    """)
+
+def save_tmpdb_to_db(file, password):
+    os.system(f"""
+        cat {file} | \
+        openssl enc \
+        -aes-256-cbc \
+        -iter 100000 \
+        -salt -pass \
+        pass:{password} \
+        -out {encdbpath + encdbfile} 
+    """)
+
+def create_passlock():
+    for sql in schema:
+        subprocess.run(["sqlite3",
+                f"{HOME}/.passlock.db",
+                sql])
+
+    password = getpass("create password: ")
+
+    save_tmpdb_to_db(f"{HOME}/.passlock.db", password)
+
+
+def textWidth(string, length, padding):
+    string = str(string)
+    strlen = len(string)
+
+    if strlen > length:
+        diff = length - strlen
+
+        newstr = string[:diff - padding]
+
+        while padding > 0:
+            newstr += " "
+            padding -= 1
+
+        return newstr
+
+    newstr = string
+
+    for i in range(length - strlen):
+        newstr += " "
+
+    return newstr
+
+def create_old( place, kind):
+    c.execute(f"SELECT id,{kind},date FROM current WHERE place=?",
+            (place,))
+
+    old = c.fetchone()
+
+    c.execute("INSERT INTO old VALUES (?,?,?,?)",
+            (old[0], kind, old[1], old[2]))
+
+def create_new(new, place, kind):
+    c.execute(f"""UPDATE current SET {kind}=?, date=? WHERE place=?""",
+            (new, timestamp, place))
+
+def printColumns(items, widths, fields):
+
+    print()
+
+    for column in enumerate(items):
+        if column[0] == 0:
+            rowlen = 0
+            print("\x1b[33m", end="")
+
+            for field in enumerate(fields):
+                text = textWidth(field[1], widths[field[0]], 2)
+                rowlen += len(text)
+                print(text, end="")
+
+            print("\x1b[39m")
+
+            for i in range(rowlen):
+                print("─", end="")
+
+            print()
+
+        for row in enumerate(column[1]):
+            print(textWidth(row[1], widths[row[0]], 2), end="")
+
+        print()
+
+    print()
+
+
+if __name__ == "__main__":
+    if not os.path.isfile(encdbpath + encdbfile):
+        print("no .passlock.db file is found.")
+        confirm = input("do you want to create one (y/n): ") == "y"
+
+        if confirm:
+            create_passlock()
+
+        sys.exit(0)
+
+    password = getpass("password for database: ")
+    tmp_fp = tempfile.NamedTemporaryFile()
+
+    decrypt_tmp_db(tmp_fp.name, password)
+
+    if argslen > 0 and args[0] == "sql":
+        os.system(f"sqlite3 {tmp_fp.name}")
+
+        save_tmpdb_to_db(tmp_fp.name, password)
+
+        sys.exit(0)
+    else:
+        conn = sqlite3.connect(f"{tmp_fp.name}")
+        c = conn.cursor()
+
+    if argslen == 0:
+        c.execute("SELECT * from current")
+        fetch = c.fetchall()
+
+        if len(fetch) > 0:
+            printColumns(
+                fetch,
+                (4,    20,      10,         17,         30,      11    ),
+                ("id", "place", "username", "password", "email", "date")
+            )
+        else:
+            print("database empty")
+
+        enditall(0)
+
+    for idx in range(argslen):
+        if idx == 0:
+            if args[idx] == "new":
+
+                info = args[idx + 1: ]
+
+                infolen = len(info)
+
+                if infolen < 3:
+                    eprint("not enough argument")
+                    sys.exit(2)
+
+                if infolen == 4 and info[3] == "GEN":
+                    info[3] = genSecure(timestamp)
+                else:
+                    info.append(getpass("create password: "))
+
+                sys.stdout = open(os.devnull, 'w')
+                pyperclip.copy(f"{info[-1]}")
+
+                create_site(c, timestamp, info)
+
+            if args[idx] == "update":
+                place = args[idx + 1]
+                info = args[idx + 2: ]
+
+                for arg in enumerate(info):
+                    if arg[1] == "username" or  \
+                       arg[1] == "email" or \
+                       arg[1] == "place":
+
+                        create_old(place, arg[1])
+
+                        new = info[arg[0] + 1]
+
+                        create_new(new, place, arg[1])
+
+                    elif arg[1] == "password":
+                        create_old(place, arg[1])
+
+                        if len(info) > 1 and info[arg[0] + 1] == "GEN":
+                            c.execute("UPDATE current SET password=? WHERE place=?",
+                                    (genSecure(timestamp), place))
+                        else:
+                            c.execute("UPDATE current SET password=? WHERE place=?",
+                                    (getpass("create password: "), place))
+
+            if args[idx] == "wipe":
+                confirm = input("are you sure you want \
+to \x1b[32mWIPE\x1b[39m your database (y/n): ") == "y"
+
+                if confirm:
+                    isUser = input("type your username to confirm: ") == USER
+
+                    if isUser:
+                        print("incorrect, not procceding")
+                        enditall(0)
+
+                    print("wiping..")
+
+                    c.execute("DROP TABLE current")
+                    c.execute("DROP TABLE old")
+
+                    for sql in schema:
+                        c.execute(sql)
+
+            if args[idx] == "getpw":
+                c.execute("SELECT username,password FROM current WHERE place=?", (args[idx + 1],))
+                output = c.fetchall()
+
+                outputlen = len(output)
+
+                if outputlen == 0:
+                    print("no information for this place")
+                    enditall(0)
+
+                elif len(output) == 1:
+                    sys.stdout = open(os.devnull, 'w')
+                    pyperclip.copy(f"{escapeDoubleQuote(output[0][1])}\n")
+
+                else:
+                    print("Multiple choices. Please select one:")
+
+                    for select in enumerate(output):
+                        print(select[0], select[1][0])
+
+                    choice = int(input("choose: "))
+
+                    sys.stdout = open(os.devnull, 'w')
+                    pyperclip.copy(f"{escapeDoubleQuote(output[choice][1])}\n")
+
+
+            if args[idx] == "old":
+                c.execute("SELECT * from old")
+                fetch = c.fetchall()
+
+                if len(fetch) > 0:
+                    printColumns(
+                        fetch,
+                        (4,    20,     10,      10    ),
+                        ("id", "type", "value", "date")
+                    )
+                else:
+                    print("database is empty")
+
+                enditall(0)
+
+            if args[idx] == "create":
+                confirm = input("you sure you want to make a new\
+.passlock.db file?(y/n): ") == "y"
+
+                if confirm:
+                    create_passlock()
+
+    conn.commit()
+    save_tmpdb_to_db(tmp_fp.name, password)
+    enditall(0)
